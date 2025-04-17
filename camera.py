@@ -7,11 +7,18 @@ import time
 # 尝试 0, 1, 2 ... 直到找到正确的那个。内置摄像头通常是 0。
 CAMERA_INDEX = 1  # 尝试修改这个值 (例如 0, 1, 2...)
 
-# (可选) 尝试设置期望的分辨率 (这是 *合并后* 的分辨率)
+#  尝试设置期望的分辨率 (这是 *合并后* 的分辨率)
 # 例如，如果每个眼睛是 1280x720，那么左右拼接后可能是 2560x720
 # 如果不确定，可以注释掉这两行，先看摄像头默认输出什么
-REQUESTED_WIDTH = 2560
-REQUESTED_HEIGHT = 720
+# REQUESTED_WIDTH = 2560
+# REQUESTED_HEIGHT = 720
+REQUESTED_WIDTH = 1920
+REQUESTED_HEIGHT = 540
+
+# --- 输出文件名和格式 ---
+OUTPUT_FILENAME_MP4 = 'example.mp4'
+OUTPUT_FILENAME_AVI = 'example.avi'
+DEFAULT_FPS = 30.0 # 如果无法获取摄像头FPS，则使用此默认值
 
 # --- 初始化摄像头 ---
 print(f"尝试打开摄像头 (索引 {CAMERA_INDEX})...")
@@ -45,6 +52,40 @@ actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
 print(f"摄像头实际输出分辨率: {actual_width}x{actual_height}")
 
+# 尝试获取 FPS
+actual_fps = cap.get(cv2.CAP_PROP_FPS)
+if actual_fps <= 0:
+    print(f"警告: 无法获取摄像头 FPS，将使用默认值 {DEFAULT_FPS} FPS 进行录制。")
+    actual_fps = DEFAULT_FPS
+else:
+    print(f"检测到摄像头 FPS: {actual_fps:.2f} (将用于视频录制)")
+
+# --- 初始化 VideoWriter ---
+frame_size = (actual_width, actual_height)
+
+# MP4 Writer (使用 mp4v 编解码器)
+fourcc_mp4 = cv2.VideoWriter_fourcc(*'mp4v')
+video_writer_mp4 = cv2.VideoWriter(OUTPUT_FILENAME_MP4, fourcc_mp4, actual_fps, frame_size)
+if not video_writer_mp4.isOpened():
+    print(f"错误: 无法打开文件 '{OUTPUT_FILENAME_MP4}' 进行 MP4 写入。")
+    video_writer_mp4 = None # 标记为无效
+
+# AVI Writer (使用 XVID 编解码器)
+fourcc_avi = cv2.VideoWriter_fourcc(*'XVID')
+video_writer_avi = cv2.VideoWriter(OUTPUT_FILENAME_AVI, fourcc_avi, actual_fps, frame_size)
+if not video_writer_avi.isOpened():
+    print(f"错误: 无法打开文件 '{OUTPUT_FILENAME_AVI}' 进行 AVI 写入。")
+    video_writer_avi = None # 标记为无效
+
+if video_writer_mp4 is None and video_writer_avi is None:
+    print("错误：无法初始化任何视频写入器，将仅显示视频流。")
+elif video_writer_mp4 is not None and video_writer_avi is not None:
+     print(f"将把视频同时保存为 '{OUTPUT_FILENAME_MP4}' 和 '{OUTPUT_FILENAME_AVI}'")
+elif video_writer_mp4 is not None:
+     print(f"将把视频保存为 '{OUTPUT_FILENAME_MP4}' (AVI写入失败)")
+else: # video_writer_avi is not None
+     print(f"将把视频保存为 '{OUTPUT_FILENAME_AVI}' (MP4写入失败)")
+
 # 检查分辨率是否合理（例如，宽度是否大约是高度的两倍，如果左右拼接的话）
 if actual_width < actual_height * 1.5: # 粗略检查，不适用于上下拼接
     print("警告：摄像头输出的宽度看起来不像典型的左右拼接双目图像。请检查输出图像。")
@@ -66,6 +107,13 @@ while True:
     if not ret:
         print("错误：无法读取摄像头帧。")
         break
+
+    # --- 写入视频帧 --- (在分割和显示之前写入原始合并帧)
+    if combined_frame is not None:
+        if video_writer_mp4 is not None:
+            video_writer_mp4.write(combined_frame)
+        if video_writer_avi is not None:
+            video_writer_avi.write(combined_frame)
 
     # --- 分割图像 ---
     # 确保帧不是 None 并且宽度足够分割
@@ -110,6 +158,15 @@ while True:
 # --- 清理资源 ---
 print("正在释放摄像头资源...")
 cap.release()
+
+# --- 释放 VideoWriter ---
+if video_writer_mp4 is not None:
+    print(f"正在关闭 MP4 文件 '{OUTPUT_FILENAME_MP4}'...")
+    video_writer_mp4.release()
+if video_writer_avi is not None:
+    print(f"正在关闭 AVI 文件 '{OUTPUT_FILENAME_AVI}'...")
+    video_writer_avi.release()
+
 print("正在关闭所有OpenCV窗口...")
 cv2.destroyAllWindows()
 print("程序结束。")
