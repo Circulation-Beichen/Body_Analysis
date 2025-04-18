@@ -6,6 +6,10 @@ import os
 import tkinter as tk
 from tkinter import ttk # Optional: For themed widgets
 import pose_analysis # Import the new analysis module
+import visualization_3d # Import the new 3D visualization module
+import threading # 新增：导入 threading 模块
+import json # 新增：导入 json 库
+import subprocess # 新增：导入 subprocess 库
 
 # --- 全局配置和常量 ---
 # 摄像头和模式设置
@@ -20,12 +24,21 @@ BASELINE_MM = 25.0
 #CALIBRATION_FILE = 'calibration_approx.npz'
 CALIBRATION_FILE = 'stereo_calibration.npz'
 # 视频文件处理
-VIDEO_FILE_PATH = 'example_1.mp4' # 注意：使用 .mp4 扩展名
+VIDEO_FILE_PATH = 'example_hp2.mp4' # 注意：使用 .mp4 扩展名
 # Mediapipe 设置
 MODEL_COMPLEXITY = 1
 MIN_DETECTION_CONF = 0.5
 MIN_TRACKING_CONF = 0.5
 VISIBILITY_THRESHOLD = 0.1
+
+# --- 新增: EMA 平滑参数 和 全局状态 ---
+ALPHA = 0.3 # 平滑因子
+smoothed_mp_world_landmarks = {} # 平滑后的点
+pause_event = threading.Event() # 新增：全局暂停事件
+vis_thread = None # 新增：全局可视化线程引用
+
+# --- 新增：全局变量，用于数据记录 ---
+recorded_pose_data = [] # 存储所有帧的姿态数据
 
 # --- 全局变量 (在主程序块中初始化) ---
 mp_pose = None
@@ -38,13 +51,14 @@ combined_width, combined_height = 0, 0 # 合并尺寸
 
 # --- 核心处理函数 ---
 def process_frame(frame_left, frame_right, K1, dist1, K2, dist2, P1, P2, pose):
-    """处理左右帧，进行姿态估计和3D三角测量（近似）"""
-    # print("--- 开始处理帧 ---") # 添加帧处理开始标记
-    points_3d_world = {}
+    """处理左右帧，进行姿态估计，以MediaPipe世界坐标为主，三角测量Z值为辅。"""
+    # print("--- 开始处理帧 ---")
+    stereo_z_values_mm = {} # 存储当前帧通过三角测量计算出的有效 Z 值 (mm)
+    mp_world_points = {} # 存储当前帧有效的 MediaPipe 世界坐标点 (m)
     vis_frame_left = frame_left.copy()
     vis_frame_right = frame_right.copy()
 
-    # --- Mediapipe 处理 ---
+    # --- Mediapipe 处理 --- (获取 2D 和 World Landmarks)
     image_left_rgb = cv2.cvtColor(frame_left, cv2.COLOR_BGR2RGB)
     image_right_rgb = cv2.cvtColor(frame_right, cv2.COLOR_BGR2RGB)
     image_left_rgb.flags.writeable = False
@@ -52,42 +66,45 @@ def process_frame(frame_left, frame_right, K1, dist1, K2, dist2, P1, P2, pose):
     results_left = pose.process(image_left_rgb)
     results_right = pose.process(image_right_rgb)
 
-    # --- 提取 2D 点, 去畸变, 三角测量 ---
-    points_2d_left_raw = []
-    points_2d_right_raw = []
-    landmark_indices = []
+    # --- 提取 主要3D数据: MediaPipe World Landmarks (来自左视图结果) ---
+    if results_left.pose_world_landmarks:
+        landmarks = results_left.pose_world_landmarks.landmark
+        num_landmarks = len(landmarks)
+        print(f"  [Mediapipe World] 检测到 {num_landmarks} 个世界关键点")
+        for i in range(num_landmarks):
+            # 理论上 world landmark 没有 visibility，但 2D landmark 有，可以用来筛选
+            if results_left.pose_landmarks and i < len(results_left.pose_landmarks.landmark) and results_left.pose_landmarks.landmark[i].visibility > VISIBILITY_THRESHOLD:
+                lm = landmarks[i]
+                mp_world_points[mp_pose.PoseLandmark(i)] = np.array([lm.x, lm.y, lm.z])
+        print(f"    - 存储了 {len(mp_world_points)} 个可见的世界关键点")
+    # else:
+        # print("  [Mediapipe World] 左视图未检测到世界关键点")
 
-    num_landmarks_left = len(results_left.pose_landmarks.landmark) if results_left.pose_landmarks else 0
-    num_landmarks_right = len(results_right.pose_landmarks.landmark) if results_right.pose_landmarks else 0
-    print(f"  [Mediapipe] 检测到 L:{num_landmarks_left}, R:{num_landmarks_right} 关键点") # 打印检测数量 (中文)
-
+    # --- 计算 辅助数据: Stereo Z (mm) ---
+    # 这部分代码与之前类似，但只为了获取 Z 值
     if results_left.pose_landmarks and results_right.pose_landmarks:
         landmarks_left = results_left.pose_landmarks.landmark
         landmarks_right = results_right.pose_landmarks.landmark
-        num_landmarks = min(num_landmarks_left, num_landmarks_right)
+        num_landmarks_stereo = min(len(landmarks_left), len(landmarks_right))
 
-        # 提取原始像素坐标并检查可见性
-        visibility_threshold = VISIBILITY_THRESHOLD # 使用全局变量
-        for i in range(num_landmarks):
+        points_2d_left_raw = []
+        points_2d_right_raw = []
+        landmark_indices_stereo = []
+
+        for i in range(num_landmarks_stereo):
             lm_l = landmarks_left[i]
             lm_r = landmarks_right[i]
-            if lm_l.visibility > visibility_threshold and lm_r.visibility > visibility_threshold:
+            if lm_l.visibility > VISIBILITY_THRESHOLD and lm_r.visibility > VISIBILITY_THRESHOLD:
                 x_l, y_l = int(lm_l.x * frame_width), int(lm_l.y * frame_height)
                 x_r, y_r = int(lm_r.x * frame_width), int(lm_r.y * frame_height)
-                x_l = max(0, min(x_l, frame_width - 1))
-                y_l = max(0, min(y_l, frame_height - 1))
-                x_r = max(0, min(x_r, frame_width - 1))
-                x_r = max(0, min(x_r, frame_width - 1))
+                # (边界检查可以省略，因为我们只关心Z值)
                 points_2d_left_raw.append([x_l, y_l])
                 points_2d_right_raw.append([x_r, y_r])
-                landmark_indices.append(i)
+                landmark_indices_stereo.append(i)
 
-        # print(f"  [可见性筛选] 找到 {len(landmark_indices)} 对满足阈值 {visibility_threshold} 的匹配点") # 打印可见点对数量 (中文)
-
-        # --- 去畸变 ---
-        points_2d_left_undistorted = []
-        points_2d_right_undistorted = []
-        if points_2d_left_raw and points_2d_right_raw:
+        if landmark_indices_stereo: # 只有同时可见的点才继续
+            points_2d_left_undistorted = []
+            points_2d_right_undistorted = []
             np_points_2d_left_raw = np.array(points_2d_left_raw, dtype=np.float32).reshape(-1, 1, 2)
             np_points_2d_right_raw = np.array(points_2d_right_raw, dtype=np.float32).reshape(-1, 1, 2)
             try:
@@ -95,45 +112,50 @@ def process_frame(frame_left, frame_right, K1, dist1, K2, dist2, P1, P2, pose):
                 undistorted_right_raw = cv2.undistortPoints(np_points_2d_right_raw, K2, dist2, None, K2)
                 points_2d_left_undistorted = undistorted_left_raw.reshape(-1, 2)
                 points_2d_right_undistorted = undistorted_right_raw.reshape(-1, 2)
-                # print(f"  [去畸变] 完成 {len(points_2d_left_undistorted)} 对点的去畸变") # 打印去畸变后数量 (中文)
             except Exception as e:
-                 print(f"错误: 去畸变点时出错: {e}")
-                 landmark_indices = []
-        # else:
-             # print("  [去畸变] 没有点需要去畸变")
+                 print(f"错误: [Stereo Z] 去畸变点时出错: {e}")
+                 landmark_indices_stereo = []
 
-        # --- 三角测量 ---
-        num_points_for_triangulation = len(landmark_indices)
-        print(f"  [三角测量] 尝试对 {num_points_for_triangulation} 对点进行三角测量") # 打印尝试三角测量的数量 (中文)
-        if num_points_for_triangulation > 0 and len(points_2d_left_undistorted) == num_points_for_triangulation and len(points_2d_right_undistorted) == num_points_for_triangulation:
-            try:
-                points_4d_hom = cv2.triangulatePoints(P1, P2, points_2d_left_undistorted.T, points_2d_right_undistorted.T)
-                print(f"    - triangulatePoints 输出形状: {points_4d_hom.shape}") # 打印三角测量输出形状 (中文)
-                valid_w_indices = np.where(np.abs(points_4d_hom[3]) > 1e-6)[0]
-                print(f"    - 找到 {len(valid_w_indices)} 个具有有效W分量的点") # 打印 W 有效数量 (中文)
-                if len(valid_w_indices) > 0:
-                    points_4d_hom_valid = points_4d_hom[:, valid_w_indices]
-                    points_3d_valid = points_4d_hom_valid[:3] / points_4d_hom_valid[3]
-                    points_3d_valid = points_3d_valid.T
-                    landmark_indices_valid = [landmark_indices[i] for i in valid_w_indices]
-                    count_valid_depth = 0
-                    for idx, point_3d in zip(landmark_indices_valid, points_3d_valid):
-                        if point_3d[2] > 0 and point_3d[2] < 20000:
-                            points_3d_world[mp_pose.PoseLandmark(idx)] = point_3d
-                            count_valid_depth += 1
-                            landmark_name = mp_pose.PoseLandmark(idx).name # 获取关键点名称
-                            print(f"      * 存储点: {landmark_name}, Z = {point_3d[2]:.1f} mm") # 打印具体Z值
-                    print(f"    - 存储了 {count_valid_depth} 个深度有效(0<Z<20000)的点") # 打印深度有效数量 (中文) - **启用**
-            except Exception as e:
-                print(f"    - 三角测量错误: {e}") # 打印三角测量错误 (中文)
-                points_3d_world = {}
-        # else:
-            # print("  [三角测量] 输入数组不匹配或为空，跳过三角测量")
+            if landmark_indices_stereo and len(points_2d_left_undistorted) == len(landmark_indices_stereo):
+                try:
+                    points_4d_hom = cv2.triangulatePoints(P1, P2, points_2d_left_undistorted.T, points_2d_right_undistorted.T)
+                    valid_w_indices = np.where(np.abs(points_4d_hom[3]) > 1e-6)[0]
+                    if len(valid_w_indices) > 0:
+                        points_4d_hom_valid = points_4d_hom[:, valid_w_indices]
+                        points_3d_stereo = points_4d_hom_valid[:3] / points_4d_hom_valid[3]
+                        points_3d_stereo = points_3d_stereo.T
+                        landmark_indices_valid_stereo = [landmark_indices_stereo[i] for i in valid_w_indices]
+                        count_valid_stereo_z = 0
+                        for idx, point_3d in zip(landmark_indices_valid_stereo, points_3d_stereo):
+                            if point_3d[2] > 0 and point_3d[2] < 10000: # 检查深度有效性
+                                stereo_z_values_mm[mp_pose.PoseLandmark(idx)] = point_3d[2]
+                                count_valid_stereo_z += 1
+                        # print(f"  [Stereo Z] 计算并存储了 {count_valid_stereo_z} 个有效 Stereo Z 值 (mm)")
+                except Exception as e:
+                    print(f"    - [Stereo Z] 三角测量错误: {e}")
 
-    # else: # 如果左右视图有一个未检测到
-        # print("  [Mediapipe] 未在两个视图中都检测到关键点")
+    # --- EMA 平滑处理 (作用于 MediaPipe World Landmarks) ---
+    global smoothed_mp_world_landmarks # 使用全局变量存储平滑状态
+    current_smoothed_mp_world_points = {} # 存储当前帧平滑后的结果
 
-    # --- 可视化 ---
+    if mp_world_points: # 仅当当前帧有世界坐标点时才进行平滑
+        for landmark_enum, current_point in mp_world_points.items():
+            if landmark_enum in smoothed_mp_world_landmarks:
+                previous_point = smoothed_mp_world_landmarks[landmark_enum]
+                smoothed_point = ALPHA * current_point + (1 - ALPHA) * previous_point
+            else:
+                smoothed_point = current_point # 初始平滑值
+            current_smoothed_mp_world_points[landmark_enum] = smoothed_point
+
+        # 更新全局平滑状态
+        smoothed_mp_world_landmarks.clear()
+        smoothed_mp_world_landmarks.update(current_smoothed_mp_world_points)
+    # else:
+        # 如果当前帧没有世界坐标点，可以保留上一帧的平滑结果或清空
+        # pass # 保留旧状态可能导致"冻结"，暂时先这样
+
+    # --- 可视化 --- (结合 2D, Smoothed World 3D, Stereo Z)
+    # 绘制 2D 检测结果 (与之前相同)
     if results_left.pose_landmarks:
         mp_drawing.draw_landmarks(vis_frame_left, results_left.pose_landmarks, mp_pose.POSE_CONNECTIONS,
                                   landmark_drawing_spec=mp_drawing.DrawingSpec(color=(245,117,66), thickness=2, circle_radius=2),
@@ -142,25 +164,33 @@ def process_frame(frame_left, frame_right, K1, dist1, K2, dist2, P1, P2, pose):
          mp_drawing.draw_landmarks(vis_frame_right, results_right.pose_landmarks, mp_pose.POSE_CONNECTIONS,
                                    landmark_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
                                    connection_drawing_spec=mp_drawing.DrawingSpec(color=(0, 128, 0), thickness=2, circle_radius=2))
-    if points_3d_world and results_left.pose_landmarks:
-        for idx, lm in enumerate(results_left.pose_landmarks.landmark):
-            landmark_enum = mp_pose.PoseLandmark(idx)
-            if landmark_enum in points_3d_world:
-                 x_pixel = int(lm.x * frame_width)
-                 y_pixel = int(lm.y * frame_height)
-                 point_3d = points_3d_world[landmark_enum]
-                 coord_text = f"Z:{point_3d[2]:.0f}mm"
-                 cv2.putText(vis_frame_left, coord_text, (x_pixel + 5, y_pixel - 5),
-                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 0), 1, cv2.LINE_AA)
 
-    # --- Perform Pose Analysis and Draw Results ---
+    # 绘制辅助 Stereo Z 值 (mm)
+    if stereo_z_values_mm and results_left.pose_landmarks:
+        num_landmarks_to_draw = min(len(results_left.pose_landmarks.landmark), len(mp_pose.PoseLandmark))
+        for i in range(num_landmarks_to_draw):
+            landmark_enum = mp_pose.PoseLandmark(i)
+            # 仅当该点在本帧成功计算出 Stereo Z 值时才绘制
+            if landmark_enum in stereo_z_values_mm:
+                lm_2d = results_left.pose_landmarks.landmark[i]
+                if lm_2d.visibility > VISIBILITY_THRESHOLD:
+                    x_pixel = int(lm_2d.x * frame_width)
+                    y_pixel = int(lm_2d.y * frame_height)
+                    # 获取 Stereo Z 值
+                    stereo_z = stereo_z_values_mm[landmark_enum]
+                    coord_text = f"Z:{stereo_z:.0f}mm"
+                    cv2.putText(vis_frame_left, coord_text, (x_pixel + 5, y_pixel - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 165, 255), 1, cv2.LINE_AA) # 用橙色区分
+
+    # --- Perform Pose Analysis and Draw Results (使用平滑后的 MediaPipe World Landmarks) ---
     analysis_angles = {}
-    analysis_classification = "No 3D Points"
-    if points_3d_world: # Only analyze if we have 3D points
-        analysis_angles, analysis_classification = pose_analysis.analyze_pose(points_3d_world)
+    # 使用平滑后的世界坐标点进行姿态分析
+    analysis_points = current_smoothed_mp_world_points if current_smoothed_mp_world_points else {}
+    if analysis_points:
+        analysis_angles, analysis_classification = pose_analysis.analyze_pose(analysis_points)
         vis_frame_left = pose_analysis.draw_pose_analysis(vis_frame_left, analysis_angles, analysis_classification)
     else:
-        # Optionally draw a message if no points were found
+        analysis_classification = "No 3D Points" # 如果没有世界坐标点
         vis_frame_left = pose_analysis.draw_pose_analysis(vis_frame_left, {}, analysis_classification)
 
     # --- 重新组合帧 ---
@@ -172,16 +202,29 @@ def process_frame(frame_left, frame_right, K1, dist1, K2, dist2, P1, P2, pose):
             output_frame = np.vstack((vis_frame_left, vis_frame_right))
     except Exception as e:
         print(f"错误: 拼接帧时出错: {e}")
-        output_frame = None # 确保返回 None
+        output_frame = None
 
-    return output_frame
+    # 返回: OpenCV 显示帧, 平滑后的世界坐标点 (用于3D可视化), 辅助 Stereo Z 值 (虽然目前没用到)
+    return output_frame, current_smoothed_mp_world_points, stereo_z_values_mm
 
-# --- 分析函数 ---
+# --- 分析函数 --- (修改暂停逻辑和线程启动)
 def run_realtime_analysis():
     """从摄像头进行实时分析"""
     global frame_width, frame_height, combined_width, combined_height # 允许修改全局尺寸变量
+    global vis_thread # 引用全局线程变量
+    smoothed_mp_world_landmarks = {} # 重置
 
     print("--- 开始实时分析 ---")
+    # --- 视角处理 (实时模式: 加载或使用默认，不保存) ---
+    print("[实时分析] 尝试加载视角...")
+    loaded_angle = visualization_3d.load_view_angle()
+    if loaded_angle:
+        elev, azim = loaded_angle
+        print(f"  - 成功加载视角: elev={elev}, azim={azim}")
+    else:
+        elev, azim = visualization_3d.DEFAULT_ELEV, visualization_3d.DEFAULT_AZIM
+        print(f"  - 加载失败或文件无效，使用默认视角: elev={elev}, azim={azim}")
+
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
     if not cap.isOpened():
         print(f"错误：无法打开摄像头 (索引 {CAMERA_INDEX})。")
@@ -235,7 +278,70 @@ def run_realtime_analysis():
     start_time_display = time.time()
     fps_display = "Calculating..."
 
+    # 初始化并启动 3D 可视化线程 (传入视角参数和暂停事件)
+    print(f"[实时分析] 初始化 3D 可视化线程，传入视角: elev={elev}, azim={azim}")
+    vis_thread = visualization_3d.VisualizationThread(
+        init_elev=elev, init_azim=azim, pause_event=pause_event
+    )
+    vis_thread.start()
+
+    is_paused = False # 新增：控制主循环暂停状态
+
     while True:
+        # --- 键盘事件处理 --- (移到循环顶部，优先处理暂停/退出)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            print("\n收到退出指令 'q'。")
+            # --- 新增：退出前检查是否暂停，若是则保存视角 ---
+            print(f"  - 检查退出时状态：is_paused = {is_paused}") # 调试打印当前暂停状态
+            if is_paused:
+                print("[主循环] 退出时检测到已暂停，尝试保存当前视角...")
+                if vis_thread and vis_thread.is_alive():
+                    print("  - 可视化线程存在且活跃，调用 get_current_view_and_save()...") # 调试打印
+                    saved_successfully = vis_thread.get_current_view_and_save()
+                    if saved_successfully:
+                        print("[主循环] 退出前视角已保存。")
+                    else:
+                        print("[主循环] 退出前视角保存失败或无法执行 (vis_thread.get_current_view_and_save 返回 False)。") # 调试打印
+                else:
+                    print("[主循环] 无法保存视角：可视化线程未运行或不存在。") # 调试打印
+            else:
+                print("  - 退出时未处于暂停状态，不尝试保存视角。") # 调试打印
+            # --- 结束新增部分 ---
+            break # 原有的退出循环
+        elif key == ord('p'): # 切换暂停状态
+            is_paused = not is_paused
+            if is_paused:
+                pause_event.set() # 通知可视化线程暂停
+                print("\n[主循环] 已暂停。请在 3D 窗口调整视角，按 P 键恢复并保存视角，或按 Q 退出并保存视角。")
+            else:
+                if vis_thread and vis_thread.is_alive():
+                    print("[主循环] 恢复中，尝试触发视角保存...") # 调试打印
+                    saved_successfully = vis_thread.get_current_view_and_save() # 调用保存函数
+                    if saved_successfully:
+                         print("[主循环] 可视化线程报告视角已保存。") # 调试打印
+                    else:
+                         print("[主循环] 可视化线程报告视角保存失败或无法执行。") # 调试打印
+                else:
+                     print("[主循环] 无法保存视角：可视化线程未运行。") # 调试打印
+                pause_event.clear() # 通知可视化线程恢复
+                print("[主循环] 已恢复。")
+
+        # --- 检查暂停状态 ---
+        if is_paused:
+            # 如果暂停，显示提示信息，但跳过大部分处理
+            # 我们需要一个"背景板"来绘制暂停提示，如果 output_frame 可用就用它
+            # 否则可能需要创建一个空的
+            # （简化：如果 output_frame 正好是 None，这帧就不显示 PAUSED）
+            if 'output_frame' in locals() and output_frame is not None:
+                cv2.putText(output_frame, "PAUSED (Press P to Resume & Save View, Q to Quit & Save View)",
+                            (output_frame.shape[1] // 2 - 350, output_frame.shape[0] - 30), # 调整文本位置和内容
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.imshow("Real-time Pose Analysis", output_frame)
+            time.sleep(0.05) # 避免 CPU 空转
+            continue # 跳过本轮循环的处理
+        # --- 暂停处理结束 ---
+
         ret, combined_frame = cap.read()
         if not ret:
             print("错误：无法读取摄像头帧。")
@@ -265,8 +371,8 @@ def run_realtime_analysis():
         except Exception as e:
             continue # 分割错误，跳过
 
-        # 处理帧
-        output_frame = process_frame(frame_left, frame_right, K1, dist1, K2, dist2, P1, P2, pose)
+        # 处理帧并获取 平滑世界点 和 辅助Z值
+        output_frame, current_smoothed_points, _ = process_frame(frame_left, frame_right, K1, dist1, K2, dist2, P1, P2, pose)
 
         # 显示帧和 FPS
         if output_frame is not None:
@@ -287,20 +393,207 @@ def run_realtime_analysis():
             else:
                 print("Skipping display: Invalid output frame.") # Debug message
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("\n收到退出指令。")
-            break
+        # 更新 3D 可视化线程的数据
+        if vis_thread.is_alive():
+            vis_thread.update_data(current_smoothed_points)
+
+    # 停止可视化线程
+    if vis_thread and vis_thread.is_alive():
+        vis_thread.stop()
+        vis_thread.join(timeout=1)
 
     cap.release()
     cv2.destroyAllWindows()
     print("实时分析结束。")
 
+# --- 新增：数据后处理函数，进行筛选和插值 ---
+def filter_and_interpolate_data(raw_data, min_landmarks=30, min_gap_to_remove=10):
+    """
+    对录制的原始姿态数据进行筛选和插值。
+
+    Args:
+        raw_data (list): 包含每帧 landmark 字典的列表。
+                         每个字典的 key 是 landmark 枚举，value 是 numpy array。
+        min_landmarks (int): 保留帧所需的最小关键点数。
+        min_gap_to_remove (int): 连续劣质帧达到此长度时将其移除。
+
+    Returns:
+        list: 处理后的数据列表，每帧保证包含所有 33 个关键点。
+    """
+    print(f"--- 开始后处理数据：共 {len(raw_data)} 帧 ---")
+    if not raw_data:
+        return []
+
+    processed_data = []
+    frame_status = [] # 0: 劣质 (<min), 1: 部分 (>=min, <33), 2: 完整 (==33)
+    landmark_keys = list(mp_pose.PoseLandmark) # 获取所有33个关键点的枚举列表
+
+    # --- Pass 1: 初始状态标记 ---
+    print("Pass 1: 标记帧状态...")
+    valid_frame_indices = [] # 存储所有初始看起来可能有效的帧的索引
+    for i, frame_dict in enumerate(raw_data):
+        count = len(frame_dict)
+        if count == 33:
+            frame_status.append(2)
+            processed_data.append(frame_dict.copy()) # 先复制一份完整数据
+            valid_frame_indices.append(i)
+        elif count >= min_landmarks:
+            frame_status.append(1)
+            processed_data.append(frame_dict.copy()) # 复制部分数据，待插值
+            valid_frame_indices.append(i)
+        else:
+            frame_status.append(0)
+            processed_data.append(None) # 劣质帧先置空
+    print(f"  - 标记完成：完整帧 {frame_status.count(2)}，部分帧 {frame_status.count(1)}，劣质帧 {frame_status.count(0)}")
+
+    # --- Pass 2: 移除长劣质帧间隙 ---
+    print(f"Pass 2: 移除长度 >= {min_gap_to_remove} 的劣质帧间隙...")
+    indices_to_remove = set()
+    i = 0
+    while i < len(frame_status):
+        if frame_status[i] == 0:
+            j = i
+            while j < len(frame_status) and frame_status[j] == 0:
+                j += 1
+            gap_length = j - i
+            if gap_length >= min_gap_to_remove:
+                print(f"  - 发现长劣质间隙：索引 {i} 到 {j-1} (长度 {gap_length})，将被移除。")
+                for k in range(i, j):
+                    indices_to_remove.add(k)
+            i = j # 跳过已检查的间隙
+        else:
+            i += 1
+
+    # 执行移除 (通过构建新的列表)
+    temp_processed_data = []
+    temp_frame_status = []
+    original_indices_map = [] # 记录新索引对应的原始索引
+    current_original_index = 0
+    for original_idx, data in enumerate(processed_data):
+         if original_idx not in indices_to_remove:
+             temp_processed_data.append(data)
+             temp_frame_status.append(frame_status[original_idx])
+             original_indices_map.append(original_idx) # 记录原始索引
+         current_original_index += 1
+
+    processed_data = temp_processed_data
+    frame_status = temp_frame_status
+    print(f"  - 移除长间隙后剩余 {len(processed_data)} 帧。")
+
+    if not processed_data:
+        print("警告：移除长间隙后没有剩余数据。")
+        return []
+
+    # --- Pass 3: 插值部分帧 ---
+    print("Pass 3: 插值部分帧 (状态 1)...")
+    interpolated_count = 0
+    failed_interpolation_indices = set()
+
+    # 需要再次迭代，因为移除操作改变了索引
+    for i in range(len(processed_data)):
+        if frame_status[i] == 1: # 需要插值的帧
+            # 寻找最近的前后完整帧 (状态 2)
+            prev_valid_idx = -1
+            for k in range(i - 1, -1, -1):
+                if frame_status[k] == 2: # 找到前面的完整帧
+                    prev_valid_idx = k
+                    break
+
+            next_valid_idx = -1
+            for k in range(i + 1, len(processed_data)):
+                 if frame_status[k] == 2: # 找到后面的完整帧
+                    next_valid_idx = k
+                    break
+
+            if prev_valid_idx != -1 and next_valid_idx != -1:
+                # --- 执行插值 ---
+                prev_frame_dict = processed_data[prev_valid_idx]
+                next_frame_dict = processed_data[next_valid_idx]
+                current_frame_dict = processed_data[i]
+
+                # 计算插值比例 (使用调整后的索引)
+                prev_original_idx = original_indices_map[prev_valid_idx]
+                next_original_idx = original_indices_map[next_valid_idx]
+                current_original_idx = original_indices_map[i]
+                
+                if next_original_idx <= prev_original_idx: # 避免除零或负数
+                     print(f"  - 警告: 帧 {i} (原始 {current_original_idx}) 的前后有效帧索引无效 ({prev_original_idx}, {next_original_idx})，跳过插值。")
+                     failed_interpolation_indices.add(i)
+                     continue # 跳过这个插值
+
+                ratio = (current_original_idx - prev_original_idx) / (next_original_idx - prev_original_idx)
+
+                missing_landmarks = []
+                for landmark_key in landmark_keys:
+                    if landmark_key not in current_frame_dict:
+                         missing_landmarks.append(landmark_key)
+                         # 检查前后帧是否有该点（理论上状态2应该有）
+                         if landmark_key not in prev_frame_dict or landmark_key not in next_frame_dict:
+                              print(f"  - 警告: 帧 {i} (原始 {current_original_idx}) 缺失关键点 {landmark_key.name}，但其前后完整帧之一也缺失该点，无法插值！")
+                              failed_interpolation_indices.add(i)
+                              break # 中断当前帧的插值
+                         
+                         prev_coord = prev_frame_dict[landmark_key]
+                         next_coord = next_frame_dict[landmark_key]
+                         
+                         # 线性插值
+                         interpolated_coord = prev_coord + (next_coord - prev_coord) * ratio
+                         current_frame_dict[landmark_key] = interpolated_coord
+                
+                if i not in failed_interpolation_indices:
+                    if len(current_frame_dict) == 33:
+                         # print(f"  - 成功插值帧 {i} (原始 {current_original_idx})，补全了 {len(missing_landmarks)} 个点。")
+                         frame_status[i] = 2 # 标记为完整
+                         interpolated_count += 1
+                    else:
+                         # 如果插值后仍然不完整（例如因为前后帧缺失数据），标记为失败
+                         print(f"  - 警告: 帧 {i} (原始 {current_original_idx}) 插值后关键点数量仍不足 33 ({len(current_frame_dict)})，标记为失败。")
+                         failed_interpolation_indices.add(i)
+
+            else:
+                 print(f"  - 警告: 帧 {i} (原始 {original_indices_map[i]}) 找不到足够的前后完整帧进行插值，标记为失败。")
+                 failed_interpolation_indices.add(i)
+
+    print(f"  - 插值完成：成功插值 {interpolated_count} 帧。")
+
+    # --- Pass 4: 移除插值失败和剩余劣质帧 ---
+    print("Pass 4: 移除插值失败和剩余的劣质帧...")
+    final_data = []
+    removed_count = 0
+    for i in range(len(processed_data)):
+        # 保留状态为 2 (原始完整或成功插值) 且未标记为插值失败的帧
+        if frame_status[i] == 2 and i not in failed_interpolation_indices:
+            # 确认一下最终数量
+            if len(processed_data[i]) == 33:
+                final_data.append(processed_data[i])
+            else:
+                 print(f"  - 内部错误：帧 {i} 状态为2但关键点数不为33 ({len(processed_data[i])})，已丢弃。")
+                 removed_count += 1
+        else:
+            removed_count += 1
+
+    print(f"  - 移除完成：最终保留 {len(final_data)} 帧，移除了 {removed_count} 帧。")
+    print(f"--- 数据后处理完成 ---")
+    return final_data
 
 def run_video_file_analysis(video_path):
-    """从视频文件进行分析"""
+    """从视频文件进行分析，并在结束后导出数据。"""
     global frame_width, frame_height, combined_width, combined_height # 允许修改全局尺寸变量
+    global vis_thread
+    # global recorded_pose_data # 不再直接使用全局变量存储最终结果
+    # recorded_pose_data = [] # 每次运行时清空旧数据
+    raw_recorded_data = [] # 新增：用于存储原始的、未经过滤的数据
 
     print(f"--- 开始处理视频文件: {video_path} ---")
+    # --- 视角处理 (视频模式: 加载，若无则使用默认并保存) ---
+    loaded_angle = visualization_3d.load_view_angle()
+    if loaded_angle:
+        elev, azim = loaded_angle
+    else:
+        elev, azim = visualization_3d.DEFAULT_ELEV, visualization_3d.DEFAULT_AZIM
+        print("未找到视角文件或文件无效，使用默认视角并保存。")
+        visualization_3d.save_view_angle(elev, azim) # 保存默认值
+
     if not os.path.exists(video_path):
         print(f"错误: 视频文件 '{video_path}' 不存在。")
         return
@@ -335,7 +628,59 @@ def run_video_file_analysis(video_path):
         cap.release()
         return
 
+    # 初始化并启动 3D 可视化线程 (传入视角参数和暂停事件)
+    vis_thread = visualization_3d.VisualizationThread(
+        init_elev=elev, init_azim=azim, pause_event=pause_event
+    )
+    vis_thread.start()
+
+    is_paused = False
+    output_frame = None
+
     while cap.isOpened():
+        key = cv2.waitKey(wait_time) & 0xFF
+        if key == ord('q'):
+            print("\n收到退出指令。")
+            # --- 新增：退出前检查是否暂停，若是则保存视角 ---
+            if is_paused:
+                print("[主循环] 退出时检测到已暂停，尝试保存当前视角...")
+                if vis_thread and vis_thread.is_alive():
+                    saved_successfully = vis_thread.get_current_view_and_save()
+                    if saved_successfully:
+                        print("[主循环] 退出前视角已保存。")
+                    else:
+                        print("[主循环] 退出前视角保存失败或无法执行。")
+                else:
+                    print("[主循环] 无法保存视角：可视化线程未运行。")
+            # --- 结束新增部分 ---
+            break # 原有的退出循环
+        elif key == ord('p'):
+            is_paused = not is_paused
+            if is_paused:
+                pause_event.set()
+                print("\n[主循环] 已暂停。请在 3D 窗口调整视角，按 P 键恢复并保存视角。")
+            else: # 恢复运行
+                if vis_thread and vis_thread.is_alive():
+                    print("[主循环] 恢复中，尝试触发视角保存...") # 调试打印
+                    saved_successfully = vis_thread.get_current_view_and_save()
+                    if saved_successfully:
+                         print("[主循环] 可视化线程报告视角已保存。") # 调试打印
+                    else:
+                         print("[主循环] 可视化线程报告视角保存失败或无法执行。") # 调试打印
+                else:
+                    print("[主循环] 无法保存视角：可视化线程未运行。") # 调试打印
+                pause_event.clear()
+                print("[主循环] 已恢复。")
+
+        if is_paused:
+            # 暂停时仍需显示最后一帧并绘制提示
+            if output_frame is not None:
+                 cv2.putText(output_frame, "PAUSED (Press P to Resume & Save View)",
+                             (output_frame.shape[1] // 2 - 250, output_frame.shape[0] - 30),
+                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                 cv2.imshow("Real-time Pose Analysis", output_frame)
+            continue # 跳过后续处理
+
         ret, combined_frame = cap.read()
         if not ret:
             print("视频播放完毕或读取错误。")
@@ -361,31 +706,125 @@ def run_video_file_analysis(video_path):
         except Exception as e:
             continue
 
-        # 处理帧
-        output_frame = process_frame(frame_left, frame_right, K1, dist1, K2, dist2, P1, P2, pose)
+        # 处理帧并获取 平滑世界点 和 辅助Z值
+        output_frame, current_smoothed_points, _ = process_frame(frame_left, frame_right, K1, dist1, K2, dist2, P1, P2, pose)
+
+        # --- 修改：记录原始平滑数据 (字典 key 是 Landmark 枚举) ---
+        # 不再进行if判断，记录所有非空结果，后续处理
+        if current_smoothed_points:
+            raw_recorded_data.append(current_smoothed_points.copy()) # 存储原始字典
+        else:
+            raw_recorded_data.append({}) # 如果没有检测到，存一个空字典
+        # -------------------------------------------------------
 
         # 显示帧
         if output_frame is not None:
-            # 视频文件处理不需要实时显示 FPS，但保持窗口名一致
-            cv2.imshow("Real-time Pose Analysis", output_frame) # Renamed window
+            cv2.imshow("Real-time Pose Analysis", output_frame)
 
-        if cv2.waitKey(wait_time) & 0xFF == ord('q'): # 使用 wait_time 控制播放速度
-            print("\n收到退出指令。")
-            break
+        # 更新 3D 可视化线程的数据 (仍然使用当前帧数据)
+        if vis_thread.is_alive():
+            vis_thread.update_data(current_smoothed_points if current_smoothed_points else {}) # 传空字典如果无数据
+
+    # 停止可视化线程
+    if vis_thread and vis_thread.is_alive():
+        vis_thread.stop()
+        vis_thread.join(timeout=1)
 
     cap.release()
     cv2.destroyAllWindows()
+
+    # --- 新增：调用后处理函数 ---
+    print("--- 视频处理循环结束，开始数据后处理 ---")
+    final_pose_data_for_export = filter_and_interpolate_data(raw_recorded_data)
+
+    # --- 修改：导出处理后的数据，并转换格式 ---
+    if final_pose_data_for_export:
+        # 转换数据格式：从 {Landmark: array} 转换到 {landmark_name: list}
+        exportable_data = []
+        for frame_dict in final_pose_data_for_export:
+            frame_data_exportable = {}
+            for landmark_enum, point_array in frame_dict.items():
+                 # 确保 landmark_enum 是 PoseLandmark 类型
+                 if isinstance(landmark_enum, mp_pose.PoseLandmark):
+                     frame_data_exportable[landmark_enum.name] = point_array.tolist()
+                 else:
+                      print(f"警告：在导出转换时遇到无效的 key 类型: {type(landmark_enum)}，跳过。")
+            if len(frame_data_exportable) == 33: # 最后确认一次
+                 exportable_data.append(frame_data_exportable)
+            else:
+                 print(f"警告：后处理后的帧数据在导出转换时关键点数不为 33 ({len(frame_data_exportable)})，已丢弃。")
+
+
+        if exportable_data:
+            export_filename = "pose_data.json"
+            export_to_json(exportable_data, export_filename)
+            # 尝试自动打开 Blender
+            launch_blender_with_script(export_filename)
+        else:
+             print("错误：数据后处理和转换后没有可导出的有效数据。")
+
+    else:
+        print("数据后处理后没有录制到有效的姿态数据，跳过导出。")
+    # -----------------------------
+
     print("视频文件处理结束。")
 
+# --- 新增：导出到 JSON 的函数 ---
+def export_to_json(all_frames_data, filename="pose_data.json"):
+    """将记录的所有帧数据导出到 JSON 文件。"""
+    print(f"准备导出 {len(all_frames_data)} 帧数据到 {filename}...")
+    try:
+        with open(filename, 'w') as f:
+            json.dump(all_frames_data, f) # 可以不用 indent 节省空间
+        print(f"姿态数据已成功导出到: {filename}")
+    except Exception as e:
+        print(f"导出到 JSON 时出错: {e}")
 
-# --- GUI 函数 ---
+# --- 新增：尝试启动 Blender 的函数 ---
+def launch_blender_with_script(json_file_path):
+    """尝试找到 Blender 并使用导入脚本启动它。"""
+    blender_executable_path = None
+    # 尝试查找 Blender 的常见路径 (Windows 示例)
+    possible_paths = [
+        r"C:\Application_SourseFile\blender\blender-3.1.2-windows-x64\blender.exe", # 使用原始字符串处理反斜杠
+    ]
+    for path in possible_paths:
+        if os.path.exists(path):
+            blender_executable_path = path
+            break
+
+    if not blender_executable_path:
+        print("警告: 未能在常见位置找到 Blender 可执行文件。请手动打开 Blender。")
+        return
+
+    # 确保 Blender 导入脚本存在于 Python 脚本旁边
+    blender_script_path = os.path.join(os.path.dirname(__file__), "import_pose_json.py")
+    if not os.path.exists(blender_script_path):
+        print(f"错误: 找不到 Blender 导入脚本: {blender_script_path}")
+        print("请确保 import_pose_json.py 文件与 body_analysis.py 在同一目录下。")
+        return
+
+    print(f"尝试使用脚本 '{blender_script_path}' 启动 Blender ({blender_executable_path})...")
+    try:
+        # 使用 Popen 启动 Blender，让 Python 脚本可以继续
+        # 传递 JSON 文件路径作为脚本参数 (通过环境变量)
+        env = os.environ.copy()
+        env['POSE_JSON_FILE'] = os.path.abspath(json_file_path) # 传递绝对路径
+
+        subprocess.Popen([blender_executable_path, "-P", blender_script_path], env=env)
+        print("Blender 启动命令已发送。如果 Blender 未启动，请检查路径或手动打开。")
+    except Exception as e:
+        print(f"启动 Blender 时出错: {e}")
+
+# --- GUI 函数 --- (移除暂停按钮)
 def create_gui():
     """创建并运行 Tkinter GUI 选择界面"""
+    # global vis_thread # 不再需要访问 vis_thread
     root = tk.Tk()
     root.title("选择分析模式")
-    root.geometry("350x150") # 设置窗口大小
+    # root.geometry("450x150") # 恢复原始宽度或根据按钮调整
+    root.geometry("350x150")
 
-    # 设置样式 (可选)
     style = ttk.Style()
     style.configure("TButton", padding=6, relief="flat", font=('Helvetica', 10))
     style.configure("TLabel", padding=6, font=('Helvetica', 11))
@@ -393,24 +832,25 @@ def create_gui():
     label = ttk.Label(root, text="请选择要运行的分析模式:")
     label.pack(pady=10)
 
-    def start_realtime():
-        print("选择: 实时分析")
-        root.destroy() # 关闭 GUI 窗口
-        run_realtime_analysis()
-
-    def start_video_file():
-        print(f"选择: 处理视频文件 ({VIDEO_FILE_PATH})")
-        root.destroy() # 关闭 GUI 窗口
-        run_video_file_analysis(VIDEO_FILE_PATH)
-
     button_frame = tk.Frame(root)
     button_frame.pack(pady=10)
 
-    btn_realtime = ttk.Button(button_frame, text="实时分析 (摄像头)", command=start_realtime)
-    btn_realtime.pack(side=tk.LEFT, padx=10)
+    btn_realtime = ttk.Button(button_frame, text="实时分析 (摄像头)", command=lambda: start_analysis(root, run_realtime_analysis))
+    btn_realtime.pack(side=tk.LEFT, padx=10) # 调整回间距
 
-    btn_video = ttk.Button(button_frame, text=f"处理文件 ({os.path.basename(VIDEO_FILE_PATH)})", command=start_video_file)
-    btn_video.pack(side=tk.LEFT, padx=10)
+    btn_video = ttk.Button(button_frame, text=f"处理文件 ({os.path.basename(VIDEO_FILE_PATH)})", command=lambda: start_analysis(root, run_video_file_analysis, VIDEO_FILE_PATH))
+    btn_video.pack(side=tk.LEFT, padx=10) # 调整回间距
+
+    # --- 移除：暂停/调整按钮及其逻辑 ---
+    # btn_pause_text = tk.StringVar(value="暂停 & 调整视角")
+    # is_paused = False
+    # def toggle_pause_adjust(): ...
+    # btn_pause_adjust = ttk.Button(...) ...
+
+    # 辅助函数，用于启动分析并在之后运行 mainloop
+    def start_analysis(root_window, analysis_func, *args):
+        root_window.destroy() # 关闭选择窗口
+        analysis_func(*args)  # 运行选择的分析函数
 
     root.mainloop()
 
@@ -457,4 +897,6 @@ if __name__ == "__main__":
     # 清理 Mediapipe 资源
     if pose:
         pose.close()
+    # 确保关闭 Matplotlib 窗口 (如果主循环未正常结束)
+    # visualization_3d.close_plot() # 不再需要，线程会自行处理
     print("程序完全结束。")

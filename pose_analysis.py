@@ -2,6 +2,8 @@ import numpy as np
 import math
 import mediapipe as mp
 import cv2
+# 导入 PIL 相关库
+from PIL import ImageDraw, ImageFont, Image
 
 mp_pose = mp.solutions.pose
 
@@ -39,15 +41,16 @@ def calculate_angle(a, b, c):
 
 def analyze_pose(points_3d_world):
     """
-    分析 3D 姿态关键点，计算关节角度并对简单姿态进行分类。
+    分析 3D 姿态关键点 (期望输入为 Mediapipe 世界坐标系，单位：米)，
+    计算关节角度并对简单姿态进行分类。
 
     Args:
-        points_3d_world (dict): 映射 PoseLandmark 枚举到 3D 坐标的字典。
+        points_3d_world (dict): 映射 PoseLandmark 枚举到 3D 世界坐标 (米) 的字典。
 
     Returns:
         tuple: 包含以下元素的元组:
             - dict: 计算出的角度字典 (例如: {'left_elbow': 160.5, ...})。
-            - str: 描述分类姿态的字符串 (例如: "Standing Straight")。
+            - str: 描述分类姿态的字符串 (例如: "站直")。
     """
     angles = {}
     pose_classification = "未知" # 姿态分类初始化为未知
@@ -95,23 +98,69 @@ def analyze_pose(points_3d_world):
     else: # 其他情况
         pose_classification = "中间状态 / 其他"
 
+    # 注意：当前的分类逻辑仅基于角度，不受坐标系尺度和原点影响。
+    # 如果未来添加基于绝对位置或距离的判断，需要考虑坐标系(米，相对臀部中心)。
     return angles, pose_classification
 
 def draw_pose_analysis(vis_frame, angles, classification):
-    """将计算出的角度和分类信息绘制到给定的图像帧上。"""
-    y_offset = 30 # 初始 Y 坐标偏移量，避免遮挡其他信息 (如 FPS)
-    # 显示姿态分类结果
-    cv2.putText(vis_frame, f"姿态: {classification}", (10, y_offset), # 文本内容和位置
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2) # 字体、大小、颜色、粗细
-    y_offset += 25 # 增加 Y 坐标偏移，为下一行文本留出空间
+    """将计算出的角度和分类信息绘制到给定的图像帧上 (支持中文)。"""
+    y_offset = 30 # 初始 Y 坐标偏移量
 
-    # 显示计算出的角度
+    # --- 使用 PIL 绘制中文 --- (需要 Pillow 库: pip install Pillow)
+    try:
+        # 1. 选择一个支持中文的字体文件路径 (你需要根据你的系统修改此路径)
+        # 常见的 Windows 字体路径:
+        # font_path = "C:/Windows/Fonts/simhei.ttf"  # 黑体
+        # font_path = "C:/Windows/Fonts/msyh.ttc"   # 微软雅黑 (可能需要指定字体索引, 如 font = ImageFont.truetype(font_path, size, index=0))
+        font_path = "C:/Windows/Fonts/simhei.ttf"  # 使用黑体作为示例
+
+        # 2. 加载字体和大小
+        font_size_cn = 20 # 中文字体大小
+        font_cn = ImageFont.truetype(font_path, font_size_cn)
+
+        # 3. 将 OpenCV 图像 (BGR) 转换为 PIL 图像 (RGB)
+        #   必须先确保 vis_frame 不是 None 且是有效的图像
+        if vis_frame is None or vis_frame.size == 0:
+             print("错误: 输入到 draw_pose_analysis 的 vis_frame 无效")
+             return vis_frame # 或者返回一个错误指示?
+
+        img_pil = Image.fromarray(cv2.cvtColor(vis_frame, cv2.COLOR_BGR2RGB))
+
+        # 4. 创建一个 Draw 对象
+        draw = ImageDraw.Draw(img_pil)
+
+        # 5. 绘制中文文本 (姿态分类)
+        text_cn = f"姿态: {classification}"
+        #   注意 PIL 的坐标原点和颜色格式 (RGBA 或 RGB)
+        #   为了便于定位，文本的 Y 坐标通常是基线位置，稍微调整一下
+        draw.text((10, y_offset - font_size_cn // 2), text_cn, font=font_cn, fill=(0, 255, 255, 255)) # 黄色 (RGBA)
+
+        # 6. 将 PIL 图像转换回 OpenCV 图像 (BGR)
+        vis_frame = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+        y_offset += 30 # 更新偏移量 (给中文留出比英文稍多的空间)
+
+    except IOError:
+        print(f"警告: 无法加载字体 {font_path}。将使用 OpenCV 默认字体绘制中文（可能显示为问号）。")
+        # 如果加载字体失败，回退到 OpenCV 的 putText (会显示问号)
+        cv2.putText(vis_frame, f"Pose: {classification} (Font Error)", (10, y_offset), # 添加提示
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        y_offset += 25
+    except Exception as e:
+         print(f"绘制中文时出错: {e}")
+         # 保险起见，还是用 OpenCV 绘制一下，即使是问号
+         cv2.putText(vis_frame, f"Pose: {classification} (Draw Error)", (10, y_offset),
+                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+         y_offset += 25
+
+    # --- 使用 OpenCV 绘制英文角度信息 (保持不变) ---
+    font_size_en = 0.5
     for name, angle in angles.items():
         # 将变量名转换为更易读的显示名称 (例如 'left_elbow' -> 'Left Elbow')
         display_name = name.replace('_', ' ').title()
         # 绘制角度文本
-        cv2.putText(vis_frame, f"{display_name}: {angle:.1f} deg", (10, y_offset), # 保留一位小数
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        cv2.putText(vis_frame, f"{display_name}: {angle:.1f} deg", (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_size_en, (255, 255, 0), 1) # 青色
         y_offset += 20 # 增加 Y 坐标偏移
         if y_offset > vis_frame.shape[0] - 10: # 检查是否超出图像底部，防止绘制到屏幕外
             break # 如果超出则停止绘制更多角度
