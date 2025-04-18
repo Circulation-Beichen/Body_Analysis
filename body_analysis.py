@@ -16,9 +16,10 @@ REQUESTED_WIDTH = 1920
 REQUESTED_HEIGHT = 540
 # 3D 重建假设参数
 BASELINE_MM = 25.0
-CALIBRATION_FILE = 'calibration_approx.npz'
+#CALIBRATION_FILE = 'calibration_approx.npz'
+CALIBRATION_FILE = 'stereo_calibration.npz'
 # 视频文件处理
-VIDEO_FILE_PATH = 'example.mp4' # 注意：使用 .mp4 扩展名
+VIDEO_FILE_PATH = 'example_1.mp4' # 注意：使用 .mp4 扩展名
 # Mediapipe 设置
 MODEL_COMPLEXITY = 1
 MIN_DETECTION_CONF = 0.5
@@ -196,6 +197,10 @@ def run_realtime_analysis():
     combined_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     combined_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"摄像头实际输出分辨率 (合并): {combined_width}x{combined_height}")
+    
+    #读取实际FPS
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"摄像头实际FPS: {actual_fps}")
 
     # 计算单目尺寸和分割点
     split_point_h, split_point_v = 0, 0
@@ -407,11 +412,11 @@ if __name__ == "__main__":
     if os.path.exists(CALIBRATION_FILE):
         try:
             data = np.load(CALIBRATION_FILE)
-            K1 = data['mtx1']
-            dist1 = data['dist1']
-            K2 = data['mtx2']
-            dist2 = data['dist2']
-            print(f"从 '{CALIBRATION_FILE}' 加载了近似标定参数。")
+            K1 = data['mtx_left']
+            dist1 = data['dist_left']
+            K2 = data['mtx_right']
+            dist2 = data['dist_right']
+            print(f"从 '{CALIBRATION_FILE}' 加载了标定参数。")
         except Exception as e:
             print(f"错误: 加载标定文件 '{CALIBRATION_FILE}' 时出错: {e}")
             exit()
