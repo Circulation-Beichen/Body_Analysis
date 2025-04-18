@@ -5,6 +5,7 @@ import time
 import os
 import tkinter as tk
 from tkinter import ttk # Optional: For themed widgets
+import pose_analysis # Import the new analysis module
 
 # --- 全局配置和常量 ---
 # 摄像头和模式设置
@@ -152,6 +153,16 @@ def process_frame(frame_left, frame_right, K1, dist1, K2, dist2, P1, P2, pose):
                  cv2.putText(vis_frame_left, coord_text, (x_pixel + 5, y_pixel - 5),
                              cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 0), 1, cv2.LINE_AA)
 
+    # --- Perform Pose Analysis and Draw Results ---
+    analysis_angles = {}
+    analysis_classification = "No 3D Points"
+    if points_3d_world: # Only analyze if we have 3D points
+        analysis_angles, analysis_classification = pose_analysis.analyze_pose(points_3d_world)
+        vis_frame_left = pose_analysis.draw_pose_analysis(vis_frame_left, analysis_angles, analysis_classification)
+    else:
+        # Optionally draw a message if no points were found
+        vis_frame_left = pose_analysis.draw_pose_analysis(vis_frame_left, {}, analysis_classification)
+
     # --- 重新组合帧 ---
     output_frame = None
     try:
@@ -267,9 +278,14 @@ def run_realtime_analysis():
                 frame_count_display = 0
                 start_time_display = current_time_display
 
-            cv2.putText(output_frame, f"FPS: {fps_display}", (10, combined_height - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.imshow('Real-time Approx 3D Pose (L Cam Coords, mm)', output_frame)
+            # --- Draw FPS on the combined frame (bottom left) ---
+            # Ensure output_frame is valid before drawing FPS
+            if output_frame is not None and output_frame.shape[0] > 0 and output_frame.shape[1] > 0:
+                cv2.putText(output_frame, f"FPS: {fps_display}", (10, output_frame.shape[0] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.imshow("Real-time Pose Analysis", output_frame) # Renamed window
+            else:
+                print("Skipping display: Invalid output frame.") # Debug message
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             print("\n收到退出指令。")
@@ -351,7 +367,7 @@ def run_video_file_analysis(video_path):
         # 显示帧
         if output_frame is not None:
             # 视频文件处理不需要实时显示 FPS，但保持窗口名一致
-            cv2.imshow('Real-time Approx 3D Pose (L Cam Coords, mm)', output_frame)
+            cv2.imshow("Real-time Pose Analysis", output_frame) # Renamed window
 
         if cv2.waitKey(wait_time) & 0xFF == ord('q'): # 使用 wait_time 控制播放速度
             print("\n收到退出指令。")
